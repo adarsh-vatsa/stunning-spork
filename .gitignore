@@ -102,6 +102,7 @@ output_*.smt2
 # Docker volumes (when running locally)
 artifacts/results/
 artifacts/temp/
+replication_runs/
 
 # But keep the quacky directory
 !quacky/
