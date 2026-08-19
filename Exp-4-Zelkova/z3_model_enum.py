@@ -1,568 +1,679 @@
-from z3 import *
-import sys
-import subprocess
-import os
-import time
-import argparse  # Added for better command-line argument handling
-import re
+#!/usr/bin/env python3
+"""Reproduce the Z3 + LLM policy-summarization baseline.
+
+For each original policy, this runner:
+
+1. asks Quacky to emit an SMT-LIB encoding;
+2. enumerates up to ``--max-models`` satisfying resource strings with Z3;
+3. asks Claude to infer regex candidates from those strings;
+4. repairs candidates only when Quacky cannot parse/evaluate them;
+5. selects the candidate with the highest measured Jaccard similarity; and
+6. persists all inputs, candidates, diagnostics, and aggregate statistics.
+
+The default configuration matches the ISSRE paper protocol: 1,000 Z3 models,
+Claude 4 Sonnet, five candidates, and one syntax-repair attempt. Paths are
+repository-relative so the experiment does not depend on the original WSL
+checkout.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
 import json
-from tqdm import tqdm  # For progress bar
-import anthropic  # Changed from openai to anthropic
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from decimal import Decimal, getcontext
+from pathlib import Path
+from typing import Any
 
-# Define paths (same as in Exp-4-Zelkova.py)
-quacky_path = "/mnt/d/Research/VeriSynth/Verifying-LLMAccessControl/quacky/src/quacky.py"
-working_directory = "/mnt/d/Research/VeriSynth/Verifying-LLMAccessControl/quacky/src/"
+import anthropic
+from dotenv import load_dotenv
+from z3 import Solver, String, sat
+
+try:
+    from tqdm import tqdm
+except ImportError:  # The artifact Docker image does not need tqdm for correctness.
+    class _PlainProgress:
+        @staticmethod
+        def write(message: str) -> None:
+            print(message)
+
+        def __new__(cls, iterable: Any, **_: Any) -> Any:
+            return iterable
+
+    tqdm = _PlainProgress
 
 
+getcontext().prec = 100
 
-# Model name (changed from GPT to Claude)
-claude_model_name = "claude-4-sonnet-20250514"
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+DEFAULT_DATASET_DIR = REPO_ROOT / "Dataset"
+DEFAULT_QUACKY_PATH = REPO_ROOT / "artifacts" / "src" / "quacky.py"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "results-1000"
+DEFAULT_MODEL = "claude-sonnet-4-20250514"
+PROTOCOL_VERSION = "z3-llm-baseline-v1"
 
-def generate_smt_file(policy_path, smt_output_path):
-    """Generate SMT file from policy using quacky"""
-    quacky_path = "/mnt/d/Research/VeriSynth/Verifying-LLMAccessControl/quacky/src/quacky.py"
-    working_directory = "/mnt/d/Research/VeriSynth/Verifying-LLMAccessControl/quacky/src/"
-    
-    print(f"Generating SMT file from policy {policy_path}...")
-    
-    # Command to generate SMT file using quacky
-    smt_gen_command = [
-        "python3", quacky_path,
-        "--smt-lib",  # Use this flag for Z3-compatible SMT generation
-        "-p1", policy_path,
-        "-b", "100"
-    ]
-    
+JACCARD_NUMERATOR_RE = re.compile(r"jaccard_numerator\s+:\s+(\d+)")
+JACCARD_DENOMINATOR_RE = re.compile(r"jaccard_denominator\s+:\s+(\d+)")
+BASELINE_COUNT_RE = re.compile(r"Baseline Regex Count\s+:\s+(\d+)")
+SYNTHESIZED_COUNT_RE = re.compile(r"Synthesized Regex Count\s+:\s+(\d+)")
+
+
+class ExperimentError(RuntimeError):
+    """A reproducibility or experiment-execution error."""
+
+
+def run_command(command: list[str], *, cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
+    """Run a command and retain both output streams for the artifact trace."""
     try:
-        result = subprocess.run(smt_gen_command, cwd=working_directory, 
-                          capture_output=True, text=True, timeout=300)
-        
-        if result.stderr:
-            print(f"Warning: {result.stderr}")
-            
-        if not os.path.exists(smt_output_path):
-            print(f"Error: SMT file {smt_output_path} was not created")
-            return False
-        
-        print(f"Successfully generated SMT file: {smt_output_path}")
-        return True
-    except Exception as e:
-        print(f"Error generating SMT file: {str(e)}")
-        return False
-
-def solve_smt_file(smt_filename, max_models=10):
-    """
-    Processes an SMT formula file using Z3 solver to find satisfying models.
-    
-    Args:
-        smt_filename: Path to the SMT-LIB format file containing the formula
-        max_models: Maximum number of models to enumerate (default: 10)
-        
-    Returns:
-        List of strings representing different values for the 'resource' variable
-        that satisfy the policy constraints
-    """
-    # Create solver instance
-    solver = Solver()
-    models_list = []
-    
-    try:
-        # Load SMT file directly from disk (no need to read it in Python)
-        solver.from_file(smt_filename)
-        
-        # Check if the formula is satisfiable
-        if solver.check() == sat:
-            models_found = 0
-            print("Formula is satisfiable! Enumerating models:")
-            
-            while models_found < max_models:
-                # Get the current model
-                model = solver.model()
-                models_found += 1
-                
-                # Try to get the resource string
-                try:
-                    r = String('resource')
-                    value = model.eval(r, model_completion=True)
-                    print(value)
-                    models_list.append(str(value))
-                    solver.add(r != value)
-                except Exception as e:
-                    print(f"Error extracting resource value: {e}")
-                    break
-                
-                # Check again for satisfiability
-                if solver.check() != sat:
-                    print("No more models")
-                    break
-        else:
-            print("Unsatisfiable!")
-    except Exception as e:
-        print(f"Error parsing SMT file: {e}")
-        
-        # Try to find problematic lines - only read the file if needed for error reporting
-        error_msg = str(e)
-        line_match = re.search(r'line (\d+)', error_msg)
-        
-        if line_match:
-            line_num = int(line_match.group(1))
-            print(f"Problematic line number: {line_num}")
-            
-            # Only read the file if we need to show the problematic lines
-            try:
-                with open(smt_filename, 'r', encoding='utf-8', errors='replace') as f:
-                    lines = f.readlines()
-                
-                print(f"Problematic area near line {line_num}:")
-                start = max(0, line_num - 2)
-                end = min(len(lines), line_num + 2)
-                for i in range(start, end):
-                    if i < len(lines):
-                        print(f"Line {i+1}: {lines[i].rstrip()}")
-            except Exception as read_error:
-                print(f"Could not read file for error reporting: {read_error}")
-    
-    return models_list
-
-def process_all_policies(dataset_dir, output_dir, max_models=100, start_from=0, end_at=None):
-    """
-    Process all policy files in the dataset directory.
-    
-    Args:
-        dataset_dir: Path to the directory containing policy JSON files
-        output_dir: Path to the directory where results will be saved
-        max_models: Maximum number of models to enumerate per policy
-        start_from: Policy number to start from (inclusive)
-        end_at: Policy number to end at (inclusive), or None to process all
-        
-    Returns:
-        Dictionary mapping policy numbers to success/failure status and model counts
-    """
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Get all policy files
-    policy_files = sorted([f for f in os.listdir(dataset_dir) if f.endswith('.json')], 
-                         key=lambda x: int(x.split('.')[0]))
-    
-    # Filter by start and end policy numbers
-    policy_files = [f for f in policy_files if int(f.split('.')[0]) >= start_from]
-    if end_at is not None:
-        policy_files = [f for f in policy_files if int(f.split('.')[0]) <= end_at]
-    
-    results = {}
-    
-    print(f"Processing {len(policy_files)} policies from {dataset_dir}...")
-    
-    # IMPORTANT: The default SMT file path that quacky uses
-    default_smt_path = "/mnt/d/Research/VeriSynth/Verifying-LLMAccessControl/quacky/src/output_1.smt2"
-    
-    # Process each policy file
-    for policy_file in tqdm(policy_files, desc="Processing policies"):
-        policy_number = policy_file.split('.')[0]
-        policy_path = os.path.join(dataset_dir, policy_file)
-        
-        print(f"\n\n{'='*80}\nProcessing policy {policy_number}: {policy_path}\n{'='*80}")
-        
-        # Define output paths for this policy
-        models_output_path = os.path.join(output_dir, f"policy_{policy_number}_models.txt")
-        
-        policy_result = {
-            "policy_number": policy_number,
-            "policy_path": policy_path,
-            "models_path": models_output_path,
-            "success": False,
-            "models_count": 0,
-            "error": None
-        }
-        
-        try:
-            # Generate SMT file - ALWAYS use the default SMT path
-            if not generate_smt_file(policy_path, default_smt_path):
-                policy_result["error"] = "Failed to generate SMT file"
-                results[policy_number] = policy_result
-                continue
-            
-            # Wait a moment for file to be fully written
-            time.sleep(1)
-            
-            # Solve the SMT file - use the default SMT path
-            print(f"\nEnumerating models for policy {policy_number}:")
-            models = solve_smt_file(default_smt_path, max_models=max_models)
-            
-            if models:
-                # Save models to file
-                with open(models_output_path, 'w') as f:
-                    for model in models:
-                        f.write(f"{model}\n")
-                
-                policy_result["success"] = True
-                policy_result["models_count"] = len(models)
-                print(f"Successfully generated {len(models)} models for policy {policy_number}")
-            else:
-                policy_result["error"] = "No models found"
-                print(f"No models found for policy {policy_number}")
-        
-        except Exception as e:
-            policy_result["error"] = str(e)
-            print(f"Error processing policy {policy_number}: {str(e)}")
-        
-        results[policy_number] = policy_result
-        
-        # Save results after each policy (in case of interruption)
-        with open(os.path.join(output_dir, "processing_results.json"), 'w') as f:
-            json.dump(results, f, indent=2)
-    
-    print(f"\nProcessing complete. Results saved to {os.path.join(output_dir, 'processing_results.json')}")
-    
-    # Print summary
-    success_count = sum(1 for r in results.values() if r["success"])
-    print(f"\nSummary: Successfully processed {success_count} out of {len(results)} policies")
-    
-    return results
-
-# New functions for regex generation and evaluation
-
-def generate_regex(strings, output_path):
-    """
-    Generate a regex from a list of strings using Claude 3.7 Sonnet with extended thinking.
-    
-    Args:
-        strings: List of strings or newline-separated string of examples
-        output_path: Path to save the generated regex
-        
-    Returns:
-        The generated regex as a string, or None if generation failed
-    """
-    # Convert list to string if needed
-    if isinstance(strings, list):
-        strings_text = "\n".join(strings)
-    else:
-        strings_text = strings
-    
-    system_prompt = """
-    When asked to give a regex, provide ONLY the regex pattern itself. Do not include any explanations, 
-    markdown formatting, or additional text. The response should be just the regex pattern, nothing else. 
-    This is a highly critical application and it is imperative to get this right. Just give me the regex.
-    """
-    
-    prompt = f"""Give me a single regex that accepts each string in the following set of strings.
-    Make sure that you carefully go through each string before forming the regex.
-    It should be close to optimal and not super permissive:
-
-    {strings_text}
-
-    Response:"""
-
-    try:
-        print("Generating regex from models using Claude 3.7 Sonnet with extended thinking...")
-        # Updated to use Anthropic's API format with extended thinking
-        response = anthropic_client.messages.create(
-            model=claude_model_name,
-            max_tokens=20000,
-            temperature=1,  # Must be set to 1 when using extended thinking
-            thinking={
-                "type": "enabled",
-                "budget_tokens": 16000  # Allocate 16K tokens for extended thinking
-            },
-            messages=[
-                {"role": "user", "content": system_prompt + "\n\n" + prompt}
-            ]
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
         )
-        
-        # Check if there are thinking blocks in the response
-        thinking_content = None
-        for content_block in response.content:
-            if content_block.type == "thinking":
-                thinking_content = content_block.thinking
-                print("Extended thinking was used to generate the regex pattern.")
-                # Optionally save the thinking content to a separate file
-                thinking_path = output_path + ".thinking.txt"
-                with open(thinking_path, "w") as thinking_file:
-                    thinking_file.write(thinking_content)
-                print(f"Thinking process saved to {thinking_path}")
-            elif content_block.type == "redacted_thinking":
-                print("Some of Claude's internal reasoning was encrypted for safety reasons.")
-        
-        # Extract the final regex from the text content block
-        regex = None
-        for content_block in response.content:
-            if content_block.type == "text":
-                regex = content_block.text.strip()
-                break
-        
-        if regex:
-            # Save regex to file
-            with open(output_path, "w") as output_file:
-                output_file.write(regex)
-            
-            print(f"Regex generated and written to {output_path}")
-            return regex
-        else:
-            print("No text content found in the response")
-            return None
-    except Exception as e:
-        print(f"Error generating regex: {str(e)}")
-        return None
+    except subprocess.TimeoutExpired as exc:
+        raise ExperimentError(f"Command timed out after {timeout}s: {' '.join(command)}") from exc
 
-def run_final_analysis(policy_path, regex_path, timeout=300):
-    """
-    Evaluates the quality of a generated regex against the original policy using quacky.
-    
-    Args:
-        policy_path: Path to the original policy file
-        regex_path: Path to the file containing the generated regex
-        timeout: Maximum seconds to allow for the analysis (default: 300)
-        
-    Returns:
-        The output from quacky analysis as a string, or "TIMEOUT" if the operation timed out
-    """
-    command = [
-        "python3", quacky_path,
-        "-p1", policy_path,
-        "-b", "100",
-        "-cr", regex_path
-    ]
-    
+
+def generate_smt_file(policy_path: Path, quacky_path: Path, *, timeout: int) -> Path:
+    """Generate a fresh SMT-LIB file without unnecessarily invoking ABC."""
+    if not policy_path.is_file():
+        raise ExperimentError(f"Policy file not found: {policy_path}")
+    if not quacky_path.is_file():
+        raise ExperimentError(f"Quacky entry point not found: {quacky_path}")
+
+    quacky_dir = quacky_path.parent
+    translator_path = quacky_dir / "translator.py"
+    if not translator_path.is_file():
+        raise ExperimentError(f"Quacky translator not found: {translator_path}")
+    smt_path = quacky_dir / "output_1.smt2"
+    smt_path.unlink(missing_ok=True)
+
+    result = run_command(
+        [
+            sys.executable,
+            str(translator_path),
+            "--smt-lib",
+            "-p1",
+            str(policy_path),
+        ],
+        cwd=quacky_dir,
+        timeout=timeout,
+    )
+    if result.returncode != 0 or not smt_path.is_file():
+        diagnostics = (result.stdout + "\n" + result.stderr).strip()
+        raise ExperimentError(
+            f"Quacky translator failed to generate SMT for {policy_path.name} "
+            f"(exit {result.returncode}).\n{diagnostics[-4000:]}"
+        )
+    return smt_path
+
+
+def enumerate_resource_models(smt_path: Path, *, max_models: int, seed: int) -> list[str]:
+    """Enumerate distinct satisfying values of the SMT ``resource`` string."""
+    solver = Solver()
+    solver.set(random_seed=seed)
     try:
-        print(f"Running quacky analysis to evaluate regex against policy...")
-        # Use subprocess.run's built-in timeout parameter
-        result = subprocess.run(command, cwd=working_directory, capture_output=True, 
-                                text=True, timeout=timeout)
-        
-        print("Quacky Final Analysis Output:")
-        print(result.stdout)
-        if result.stderr:
-            print(f"Errors: {result.stderr}")
-        return result.stdout
-    except subprocess.TimeoutExpired:
-        print(f"Final analysis timed out after {timeout} seconds.")
-        return "TIMEOUT"
+        solver.from_file(str(smt_path))
+    except Exception as exc:
+        raise ExperimentError(f"Z3 could not parse {smt_path}: {exc}") from exc
 
-def process_policy_with_regex(policy_path, output_dir, max_models=500):
-    """
-    Process a single policy through the full pipeline:
-    1. Generate SMT file
-    2. Enumerate models
-    3. Generate regex from models
-    4. Evaluate regex against policy
-    
-    Args:
-        policy_path: Path to the policy file
-        output_dir: Directory to save outputs
-        max_models: Maximum number of models to enumerate (default: 500)
-        
-    Returns:
-        Dictionary with results
-    """
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Get policy number from path
-    policy_number = os.path.basename(policy_path).split('.')[0]
-    
-    # Define output paths
-    default_smt_path = "/mnt/d/Research/VeriSynth/Verifying-LLMAccessControl/quacky/src/output_1.smt2"
-    models_output_path = os.path.join(output_dir, f"policy_{policy_number}_models.txt")
-    regex_output_path = os.path.join(output_dir, f"policy_{policy_number}_regex.txt")
-    
-    results = {
-        "policy_number": policy_number,
-        "policy_path": policy_path,
-        "models_path": models_output_path,
-        "regex_path": regex_output_path,
-        "success": False,
-        "models_count": 0,
-        "regex": None,
-        "analysis": None,
-        "error": None
+    if solver.check() != sat:
+        return []
+
+    resource = String("resource")
+    models: list[str] = []
+    seen: set[str] = set()
+
+    while len(models) < max_models:
+        model = solver.model()
+        value = model.eval(resource, model_completion=True)
+        rendered = str(value)
+        if rendered in seen:
+            raise ExperimentError("Z3 repeated a blocked resource model; enumeration cannot progress")
+        seen.add(rendered)
+        models.append(rendered)
+        solver.add(resource != value)
+        if solver.check() != sat:
+            break
+
+    return models
+
+
+def initial_regex_prompt(samples: list[str]) -> str:
+    """Use the sample-to-regex prompt structure from PolicySummarizer."""
+    return f"""You are an expert in regular expressions and cloud security policies.
+
+I will provide you with sample strings representing cloud resource paths. Generate a regex that matches these strings and similar ones.
+
+SAMPLE STRINGS:
+{chr(10).join(samples)}
+
+Analyze the samples and generate a regex pattern that matches all of them. Look for common patterns and variable parts.
+
+IMPORTANT: Respond with ONLY the regex on a single line. No explanation, no markdown, no backticks, no anchors (^ or $).
+Give the output as a raw regex. Do not assume this regex will be used in Python or any standard regex engine. Output a plain, raw regex pattern as would be used with grep or sed."""
+
+
+def syntax_repair_prompt(samples: list[str], previous_regex: str, diagnostics: str) -> str:
+    """Ask for syntax repair without revealing semantic ground-truth counts."""
+    return f"""You are an expert in regular expressions and cloud security policies.
+
+The regex below could not be parsed or evaluated by the policy analysis tool. Correct only the regex syntax while preserving the intended pattern represented by the sample strings.
+
+SAMPLE STRINGS:
+{chr(10).join(samples)}
+
+PREVIOUS REGEX:
+{previous_regex}
+
+PARSER DIAGNOSTIC:
+{diagnostics[-2000:]}
+
+IMPORTANT: Respond with ONLY the corrected regex on a single line. No explanation, no markdown, no backticks, no anchors (^ or $)."""
+
+
+def extract_text_response(response: Any) -> str:
+    """Extract and normalize the first text block from an Anthropic response."""
+    for block in response.content:
+        if getattr(block, "type", None) == "text":
+            text = block.text.strip()
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:regex)?\s*", "", text)
+                text = re.sub(r"\s*```$", "", text)
+            text = text.strip()
+            if text.startswith("^"):
+                text = text[1:]
+            if text.endswith("$") and not text.endswith(r"\$"):
+                text = text[:-1]
+            return text.strip()
+    raise ExperimentError("Claude returned no text regex")
+
+
+def call_claude_with_trace(
+    client: anthropic.Anthropic, *, model: str, prompt: str
+) -> tuple[str, dict[str, Any]]:
+    """Generate one regex and retain non-secret API metadata for the run trace."""
+    response = client.messages.create(
+        model=model,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    usage = getattr(response, "usage", None)
+    trace = {
+        "response_id": getattr(response, "id", None),
+        "model": getattr(response, "model", model),
+        "stop_reason": getattr(response, "stop_reason", None),
+        "input_tokens": getattr(usage, "input_tokens", None),
+        "output_tokens": getattr(usage, "output_tokens", None),
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
     }
-    
-    try:
-        print(f"\n\n{'='*80}\nProcessing policy {policy_number}: {policy_path}\n{'='*80}")
-        
-        # Step 1: Generate SMT file
-        if not generate_smt_file(policy_path, default_smt_path):
-            results["error"] = "Failed to generate SMT file"
-            return results
-        
-        # Wait a moment for file to be fully written
-        time.sleep(1)
-        
-        # Step 2: Enumerate models
-        print(f"\nEnumerating models for policy {policy_number} (max: {max_models}):")
-        models = solve_smt_file(default_smt_path, max_models=max_models)
-        
-        if not models:
-            results["error"] = "No models found"
-            return results
-        
-        # Save models to file
-        with open(models_output_path, 'w') as f:
-            for model in models:
-                f.write(f"{model}\n")
-        
-        results["models_count"] = len(models)
-        print(f"Successfully generated {len(models)} models for policy {policy_number}")
-        
-        # Step 3: Generate regex from models
-        regex = generate_regex(models, regex_output_path)
-        if not regex:
-            results["error"] = "Failed to generate regex"
-            return results
-        
-        results["regex"] = regex
-        
-        # Step 4: Evaluate regex against policy
-        analysis = run_final_analysis(policy_path, regex_output_path)
-        results["analysis"] = analysis
-        
-        # Try to extract precision metrics from analysis
-        try:
-            precision_match = re.search(r'Precision: ([0-9.]+)', analysis)
-            precision = float(precision_match.group(1)) if precision_match else None
-            results["precision"] = precision
-            
-            if precision is not None:
-                print(f"Precision: {precision}")
-        except Exception as e:
-            print(f"Could not extract precision metrics: {str(e)}")
-        
-        results["success"] = True
-        
-    except Exception as e:
-        results["error"] = str(e)
-        print(f"Error processing policy {policy_number}: {str(e)}")
-    
-    # Save results
-    with open(os.path.join(output_dir, f"policy_{policy_number}_results.json"), 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    return results
+    return extract_text_response(response), trace
 
-def process_all_policies_with_regex(dataset_dir, output_dir, max_models=500, start_from=0, end_at=None):
-    """
-    Process all policy files in the dataset directory through the full pipeline.
-    
-    Args:
-        dataset_dir: Path to the directory containing policy JSON files
-        output_dir: Path to the directory where results will be saved
-        max_models: Maximum number of models to enumerate per policy (default: 500)
-        start_from: Policy number to start from (inclusive)
-        end_at: Policy number to end at (inclusive), or None to process all
-        
-    Returns:
-        Dictionary mapping policy numbers to results
-    """
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Get all policy files
-    policy_files = sorted([f for f in os.listdir(dataset_dir) if f.endswith('.json')], 
-                         key=lambda x: int(x.split('.')[0]))
-    
-    # Filter by start and end policy numbers
-    policy_files = [f for f in policy_files if int(f.split('.')[0]) >= start_from]
-    if end_at is not None:
-        policy_files = [f for f in policy_files if int(f.split('.')[0]) <= end_at]
-    
-    all_results = {}
-    
-    print(f"Processing {len(policy_files)} policies from {dataset_dir} with regex generation...")
-    
-    # Process each policy file
-    for policy_file in tqdm(policy_files, desc="Processing policies"):
-        policy_path = os.path.join(dataset_dir, policy_file)
-        policy_number = policy_file.split('.')[0]
-        
-        # Process the policy
-        results = process_policy_with_regex(policy_path, output_dir, max_models)
-        all_results[policy_number] = results
-        
-        # Save all results after each policy (in case of interruption)
-        with open(os.path.join(output_dir, "all_results.json"), 'w') as f:
-            json.dump(all_results, f, indent=2)
-    
-    print(f"\nProcessing complete. Results saved to {os.path.join(output_dir, 'all_results.json')}")
-    
-    # Print summary
-    success_count = sum(1 for r in all_results.values() if r["success"])
-    print(f"\nSummary: Successfully processed {success_count} out of {len(all_results)} policies")
-    
-    return all_results
+
+def call_claude(client: anthropic.Anthropic, *, model: str, prompt: str) -> str:
+    """Generate one regex candidate with the paper's Claude model family."""
+    regex, _ = call_claude_with_trace(client, model=model, prompt=prompt)
+    return regex
+
+
+def evaluate_regex(
+    policy_path: Path,
+    regex_path: Path,
+    quacky_path: Path,
+    *,
+    bound: int,
+    timeout: int,
+) -> dict[str, Any]:
+    """Evaluate a regex against the policy and parse Quacky's Jaccard output."""
+    result = run_command(
+        [
+            sys.executable,
+            str(quacky_path),
+            "-p1",
+            str(policy_path),
+            "-b",
+            str(bound),
+            "-cr",
+            str(regex_path),
+        ],
+        cwd=quacky_path.parent,
+        timeout=timeout,
+    )
+    diagnostics = (result.stdout + "\n" + result.stderr).strip()
+    numerator_match = JACCARD_NUMERATOR_RE.search(diagnostics)
+    denominator_match = JACCARD_DENOMINATOR_RE.search(diagnostics)
+
+    evaluation: dict[str, Any] = {
+        "returncode": result.returncode,
+        "diagnostics": diagnostics,
+        "valid": False,
+        "jaccard_numerator": None,
+        "jaccard_denominator": None,
+        "jaccard_similarity": None,
+        "baseline_regex_count": None,
+        "synthesized_regex_count": None,
+    }
+    if not numerator_match or not denominator_match:
+        return evaluation
+
+    numerator = Decimal(numerator_match.group(1))
+    denominator = Decimal(denominator_match.group(1))
+    if denominator <= 0:
+        return evaluation
+
+    baseline_match = BASELINE_COUNT_RE.search(diagnostics)
+    synthesized_match = SYNTHESIZED_COUNT_RE.search(diagnostics)
+    evaluation.update(
+        {
+            "valid": True,
+            "jaccard_numerator": str(numerator),
+            "jaccard_denominator": str(denominator),
+            "jaccard_similarity": str(numerator / denominator),
+            "baseline_regex_count": baseline_match.group(1) if baseline_match else None,
+            "synthesized_regex_count": synthesized_match.group(1) if synthesized_match else None,
+        }
+    )
+    return evaluation
+
+
+def generate_and_score_candidate(
+    *,
+    candidate_index: int,
+    samples: list[str],
+    policy_path: Path,
+    output_dir: Path,
+    quacky_path: Path,
+    client: anthropic.Anthropic,
+    model: str,
+    bound: int,
+    timeout: int,
+    syntax_repairs: int,
+) -> dict[str, Any]:
+    """Generate one independent candidate and repair syntax when necessary."""
+    attempts: list[dict[str, Any]] = []
+    prompt = initial_regex_prompt(samples)
+
+    for repair_index in range(syntax_repairs + 1):
+        regex, response_trace = call_claude_with_trace(
+            client, model=model, prompt=prompt
+        )
+        regex_path = output_dir / f"policy_{policy_path.stem}_candidate_{candidate_index}_attempt_{repair_index}.txt"
+        regex_path.write_text(regex, encoding="utf-8")
+        evaluation = evaluate_regex(
+            policy_path,
+            regex_path,
+            quacky_path,
+            bound=bound,
+            timeout=timeout,
+        )
+        attempts.append(
+            {
+                "attempt": repair_index + 1,
+                "regex": regex,
+                "regex_path": str(regex_path),
+                "response": response_trace,
+                "evaluation": evaluation,
+            }
+        )
+        if evaluation["valid"]:
+            break
+        if repair_index < syntax_repairs:
+            prompt = syntax_repair_prompt(samples, regex, evaluation["diagnostics"])
+
+    final = attempts[-1]
+    return {
+        "candidate": candidate_index,
+        "attempts": attempts,
+        "valid": final["evaluation"]["valid"],
+        "regex": final["regex"],
+        "regex_path": final["regex_path"],
+        "jaccard_similarity": final["evaluation"]["jaccard_similarity"],
+    }
+
+
+def best_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Select the highest-Jaccard valid candidate, retaining ties by generation order."""
+    valid = [candidate for candidate in candidates if candidate["valid"]]
+    if not valid:
+        return None
+    return max(valid, key=lambda candidate: Decimal(candidate["jaccard_similarity"]))
+
+
+def process_policy(
+    policy_path: Path,
+    *,
+    output_dir: Path,
+    quacky_path: Path,
+    client: anthropic.Anthropic | None,
+    max_models: int,
+    model: str,
+    num_candidates: int,
+    syntax_repairs: int,
+    bound: int,
+    timeout: int,
+    seed: int,
+    enumerate_only: bool,
+) -> dict[str, Any]:
+    """Run the complete baseline pipeline for one policy."""
+    started = time.monotonic()
+    policy_number = policy_path.stem
+    result: dict[str, Any] = {
+        "policy_number": policy_number,
+        "policy_path": str(policy_path),
+        "requested_models": max_models,
+        "models_count": 0,
+        "model": None if enumerate_only else model,
+        "num_candidates": 0 if enumerate_only else num_candidates,
+        "syntax_repairs": 0 if enumerate_only else syntax_repairs,
+        "success": False,
+        "status": "started",
+        "error": None,
+        "candidates": [],
+        "selected_candidate": None,
+        "jaccard_similarity": None,
+        "elapsed_seconds": None,
+    }
+
+    try:
+        smt_path = generate_smt_file(policy_path, quacky_path, timeout=timeout)
+        saved_smt_path = output_dir / f"policy_{policy_number}.smt2"
+        shutil.copy2(smt_path, saved_smt_path)
+        result["smt_path"] = str(saved_smt_path)
+
+        models = enumerate_resource_models(smt_path, max_models=max_models, seed=seed)
+        if not models:
+            result.update(status="no_satisfying_resource_models", error="No satisfying resource models found")
+            return result
+
+        models_path = output_dir / f"policy_{policy_number}_models.txt"
+        models_path.write_text("\n".join(models) + "\n", encoding="utf-8")
+        result.update(models_count=len(models), models_path=str(models_path), status="models_enumerated")
+
+        if enumerate_only:
+            result.update(success=True, status="enumeration_complete")
+            return result
+        if client is None:
+            raise ExperimentError("Anthropic client is required for regex generation")
+
+        candidates = []
+        for candidate_index in range(1, num_candidates + 1):
+            candidates.append(
+                generate_and_score_candidate(
+                    candidate_index=candidate_index,
+                    samples=models,
+                    policy_path=policy_path,
+                    output_dir=output_dir,
+                    quacky_path=quacky_path,
+                    client=client,
+                    model=model,
+                    bound=bound,
+                    timeout=timeout,
+                    syntax_repairs=syntax_repairs,
+                )
+            )
+        result["candidates"] = candidates
+        selected = best_candidate(candidates)
+        if selected is None:
+            result.update(status="no_valid_regex", error="No candidate produced a parsable Jaccard result")
+            return result
+
+        selected_path = output_dir / f"policy_{policy_number}_regex.txt"
+        selected_path.write_text(selected["regex"], encoding="utf-8")
+        result.update(
+            success=True,
+            status="complete",
+            selected_candidate=selected["candidate"],
+            regex=selected["regex"],
+            regex_path=str(selected_path),
+            jaccard_similarity=selected["jaccard_similarity"],
+        )
+        return result
+    except Exception as exc:
+        result.update(status="error", error=f"{type(exc).__name__}: {exc}")
+        return result
+    finally:
+        result["elapsed_seconds"] = round(time.monotonic() - started, 3)
+
+
+def summarize_results(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Compute coverage-aware statistics without excluding perfect matches."""
+    scored: list[tuple[str, Decimal]] = []
+    for policy_number, result in results.items():
+        value = result.get("jaccard_similarity")
+        if value is not None:
+            scored.append((policy_number, Decimal(str(value))))
+
+    similarities = [value for _, value in scored]
+    mean = sum(similarities, Decimal(0)) / len(similarities) if similarities else None
+    ordered = sorted(similarities)
+    if not ordered:
+        median = None
+    elif len(ordered) % 2:
+        median = ordered[len(ordered) // 2]
+    else:
+        midpoint = len(ordered) // 2
+        median = (ordered[midpoint - 1] + ordered[midpoint]) / 2
+
+    return {
+        "policies_attempted": len(results),
+        "policies_successful": sum(bool(result.get("success")) for result in results.values()),
+        "policies_with_jaccard": len(scored),
+        "perfect_matches": sum(value == 1 for value in similarities),
+        "mean_jaccard_all_usable": str(mean) if mean is not None else None,
+        "median_jaccard_all_usable": str(median) if median is not None else None,
+        "unscored_policies": sorted(
+            [policy_number for policy_number in results if policy_number not in {number for number, _ in scored}],
+            key=int,
+        ),
+        "failed_policies": {
+            policy_number: result.get("error") or result.get("status")
+            for policy_number, result in sorted(results.items(), key=lambda item: int(item[0]))
+            if not result.get("success")
+        },
+    }
+
+
+def write_results(output_dir: Path, results: dict[str, dict[str, Any]], run_config: dict[str, Any]) -> None:
+    """Persist policy-level results and an aggregate manifest atomically."""
+    summary = summarize_results(results)
+    payload = {"run_config": run_config, "summary": summary, "policies": results}
+    temporary_path = output_dir / "run_manifest.json.tmp"
+    temporary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary_path.replace(output_dir / "run_manifest.json")
+    (output_dir / "all_results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+def load_existing_results(output_dir: Path) -> dict[str, dict[str, Any]]:
+    results_path = output_dir / "all_results.json"
+    if not results_path.is_file():
+        return {}
+    loaded = json.loads(results_path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ExperimentError(f"Expected an object in {results_path}")
+    return loaded
+
+
+def validate_resume_config(output_dir: Path, current_config: dict[str, Any]) -> None:
+    """Prevent a resumed run from mixing incompatible experiment protocols."""
+    manifest_path = output_dir / "run_manifest.json"
+    if not manifest_path.is_file():
+        raise ExperimentError(
+            f"Cannot safely resume {output_dir}: run_manifest.json is missing. "
+            "Choose a fresh output directory."
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    previous_config = manifest.get("run_config")
+    if not isinstance(previous_config, dict):
+        raise ExperimentError(
+            f"Cannot safely resume {output_dir}: run_manifest.json has no run_config object"
+        )
+
+    comparable_keys = (
+        "protocol_version",
+        "max_models",
+        "model",
+        "num_candidates",
+        "syntax_repairs",
+        "bound",
+        "timeout",
+        "z3_seed",
+        "enumerate_only",
+    )
+    mismatches = [
+        f"{key}: previous={previous_config.get(key)!r}, current={current_config.get(key)!r}"
+        for key in comparable_keys
+        if previous_config.get(key) != current_config.get(key)
+    ]
+    if mismatches:
+        raise ExperimentError(
+            "Resume configuration does not match the existing run:\n  "
+            + "\n  ".join(mismatches)
+            + "\nChoose a fresh output directory for a different protocol."
+        )
+
+
+def prepare_quacky_runtime(quacky_path: Path, output_dir: Path) -> Path:
+    """Copy Quacky to a writable directory for its legacy temporary files."""
+    runtime_dir = output_dir / "_quacky_runtime"
+    runtime_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(quacky_path.parent, runtime_dir, dirs_exist_ok=True)
+    runtime_quacky = runtime_dir / quacky_path.name
+    if not runtime_quacky.is_file():
+        raise ExperimentError(f"Quacky runtime copy is missing {runtime_quacky}")
+    return runtime_quacky
+
+
+def build_client() -> anthropic.Anthropic:
+    load_dotenv(REPO_ROOT / ".env")
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ExperimentError("ANTHROPIC_API_KEY is required unless --enumerate-only is used")
+    return anthropic.Anthropic(api_key=api_key)
+
+
+def numeric_policy_files(dataset_dir: Path, start_from: int, end_at: int | None) -> list[Path]:
+    policies = [path for path in dataset_dir.glob("*.json") if path.stem.isdigit()]
+    policies.sort(key=lambda path: int(path.stem))
+    return [
+        path
+        for path in policies
+        if int(path.stem) >= start_from and (end_at is None or int(path.stem) <= end_at)
+    ]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
+    parser.add_argument("--quacky-path", type=Path, default=DEFAULT_QUACKY_PATH)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--max-models", type=int, default=1000)
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--num-candidates", type=int, default=5)
+    parser.add_argument("--syntax-repairs", type=int, default=1)
+    parser.add_argument("--bound", type=int, default=100)
+    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--z3-seed", type=int, default=0)
+    parser.add_argument("--start-from", type=int, default=0)
+    parser.add_argument("--end-at", type=int)
+    parser.add_argument("--enumerate-only", action="store_true")
+    parser.add_argument("--resume", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.max_models <= 0 or args.num_candidates <= 0 or args.syntax_repairs < 0:
+        raise ExperimentError("Model, candidate, and repair counts must be positive (repairs may be zero)")
+    if not args.dataset_dir.is_dir():
+        raise ExperimentError(f"Dataset directory not found: {args.dataset_dir}")
+    if not args.quacky_path.is_file():
+        raise ExperimentError(f"Quacky entry point not found: {args.quacky_path}")
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    existing_results = load_existing_results(args.output_dir)
+    if existing_results and not args.resume:
+        raise ExperimentError(
+            f"{args.output_dir}/all_results.json already exists; use --resume or choose a fresh output directory"
+        )
+
+    if not args.enumerate_only and shutil.which("abc") is None:
+        raise ExperimentError(
+            "ABC solver executable not found on PATH. Install ABC as documented in README.md "
+            "and verify that `abc --help` runs before starting the full experiment."
+        )
+    source_quacky_path = args.quacky_path.resolve()
+    runtime_quacky_path = (
+        args.quacky_path
+        if args.enumerate_only
+        else prepare_quacky_runtime(args.quacky_path, args.output_dir)
+    )
+    client = None if args.enumerate_only else build_client()
+    run_config = {
+        "protocol_version": PROTOCOL_VERSION,
+        "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        "dataset_dir": str(args.dataset_dir.resolve()),
+        "quacky_source_path": str(source_quacky_path),
+        "quacky_runtime_path": str(runtime_quacky_path.resolve()),
+        "output_dir": str(args.output_dir.resolve()),
+        "max_models": args.max_models,
+        "model": None if args.enumerate_only else args.model,
+        "num_candidates": 0 if args.enumerate_only else args.num_candidates,
+        "syntax_repairs": 0 if args.enumerate_only else args.syntax_repairs,
+        "bound": args.bound,
+        "timeout": args.timeout,
+        "z3_seed": args.z3_seed,
+        "enumerate_only": args.enumerate_only,
+    }
+    if args.resume and existing_results:
+        validate_resume_config(args.output_dir, run_config)
+    policies = numeric_policy_files(args.dataset_dir, args.start_from, args.end_at)
+    if not policies:
+        raise ExperimentError("No numeric policy JSON files matched the requested range")
+
+    results = existing_results
+    for policy_path in tqdm(policies, desc="Z3 baseline policies"):
+        previous = results.get(policy_path.stem)
+        if args.resume and previous and previous.get("success"):
+            continue
+        result = process_policy(
+            policy_path,
+            output_dir=args.output_dir,
+            quacky_path=runtime_quacky_path,
+            client=client,
+            max_models=args.max_models,
+            model=args.model,
+            num_candidates=args.num_candidates,
+            syntax_repairs=args.syntax_repairs,
+            bound=args.bound,
+            timeout=args.timeout,
+            seed=args.z3_seed,
+            enumerate_only=args.enumerate_only,
+        )
+        results[policy_path.stem] = result
+        write_results(args.output_dir, results, run_config)
+        status = "PASS" if result["success"] else "FAIL"
+        tqdm.write(f"policy {policy_path.stem}: {status} ({result['status']})")
+
+    summary = summarize_results(results)
+    print(json.dumps(summary, indent=2))
+    return 0 if summary["policies_successful"] == len(policies) else 1
+
 
 if __name__ == "__main__":
-    # Set up argument parser
-    parser = argparse.ArgumentParser(description='Generate and solve SMT formulas from policies')
-    parser.add_argument('policy_path', nargs='?', 
-                        default="/mnt/d/Research/VeriSynth/Verifying-LLMAccessControl/Dataset/1.json",
-                        help='Path to the policy JSON file')
-    parser.add_argument('--use-existing-smt', action='store_true', 
-                        help='Use existing SMT file without regenerating')
-    parser.add_argument('--max-models', type=int, default=100,
-                        help='Maximum number of models to enumerate')
-    parser.add_argument('--process-all', action='store_true',
-                        help='Process all policy files in the Dataset directory')
-    parser.add_argument('--output-dir', type=str,
-                        default="/mnt/d/Research/VeriSynth/Verifying-LLMAccessControl/Exp-4-Zelkova/results",
-                        help='Directory to save results when processing all policies')
-    parser.add_argument('--start-from', type=int, default=0,
-                        help='Policy number to start from (inclusive)')
-    parser.add_argument('--end-at', type=int, default=None,
-                        help='Policy number to end at (inclusive)')
-    parser.add_argument('--generate-regex', action='store_true',
-                        help='Generate regex from models and evaluate it')
-    parser.add_argument('--process-all-with-regex', action='store_true',
-                        help='Process all policies with regex generation and evaluation')
-    args = parser.parse_args()
-    
-    if args.process_all_with_regex:
-        # Process all policies with regex generation
-        dataset_dir = "/mnt/d/Research/VeriSynth/Verifying-LLMAccessControl/Dataset"
-        process_all_policies_with_regex(
-            dataset_dir=dataset_dir,
-            output_dir=args.output_dir,
-            max_models=args.max_models,
-            start_from=args.start_from,
-            end_at=args.end_at
-        )
-    elif args.generate_regex:
-        # Process a single policy with regex generation
-        process_policy_with_regex(
-            policy_path=args.policy_path,
-            output_dir=args.output_dir,
-            max_models=args.max_models
-        )
-    elif args.process_all:
-        # Process all policies (original functionality)
-        dataset_dir = "/mnt/d/Research/VeriSynth/Verifying-LLMAccessControl/Dataset"
-        process_all_policies(
-            dataset_dir=dataset_dir,
-            output_dir=args.output_dir,
-            max_models=args.max_models,
-            start_from=args.start_from,
-            end_at=args.end_at
-        )
-    else:
-        # Process a single policy (original functionality)
-        # SMT file path
-        smt_output_path = "/mnt/d/Research/VeriSynth/Verifying-LLMAccessControl/quacky/src/output_1.smt2"
-        
-        # Check if we need to generate a new SMT file
-        if args.use_existing_smt:
-            print(f"Using existing SMT file: {smt_output_path}")
-            if not os.path.exists(smt_output_path):
-                print(f"ERROR: SMT file does not exist at {smt_output_path}")
-                sys.exit(1)
-        else:
-            # Generate SMT file
-            if not generate_smt_file(args.policy_path, smt_output_path):
-                print("Failed to generate SMT file. Cannot proceed with model enumeration.")
-                sys.exit(1)
-            
-            # Wait a moment for file to be fully written
-            time.sleep(1)
-        
-        # Solve the SMT file
-        print("\nEnumerating models from the SMT file:")
-        solve_smt_file(smt_output_path, max_models=args.max_models)
+    try:
+        raise SystemExit(main())
+    except ExperimentError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2)

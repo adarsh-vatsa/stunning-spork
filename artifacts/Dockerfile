@@ -4,9 +4,13 @@
 # ============================================
 
 # --- Stage 1: Build ABC and dependencies from source ---
-FROM ubuntu:22.04 AS abc-builder
+FROM ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc AS abc-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
+
+ARG GLOG_COMMIT=53d58e4531c7c90f71ddab503d915e027432447a
+ARG ABC_COMMIT=04d191b793ae4d57df5ba0b9b9b37f95456e23c2
+ARG MONA_COMMIT=e10403bf9d193a0e490ce735bb5514263a00165b
 
 # System deps for building ABC, Glog, and Mona
 RUN apt-get update && apt-get install -y \
@@ -15,18 +19,23 @@ RUN apt-get update && apt-get install -y \
     flex bison python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Build Glog
-RUN git clone --depth 1 https://github.com/google/glog.git /tmp/glog \
+# Build Glog at the revision used for artifact validation
+RUN git clone https://github.com/google/glog.git /tmp/glog \
     && cd /tmp/glog \
+    && git checkout "$GLOG_COMMIT" \
     && cmake -S . -B build -G "Unix Makefiles" \
     && cmake --build build \
     && cmake --build build --target install \
     && ldconfig
 
-# Build Mona (with ABC patch)
-RUN git clone --recursive https://github.com/vlab-cs-ucsb/ABC.git /opt/ABC
+# Build Mona (with the matching ABC patch)
+RUN git clone https://github.com/vlab-cs-ucsb/ABC.git /opt/ABC \
+    && cd /opt/ABC \
+    && git checkout "$ABC_COMMIT" \
+    && git submodule update --init --recursive
 RUN git clone https://github.com/cs-au-dk/MONA.git /tmp/MONA \
     && cd /tmp/MONA \
+    && git checkout "$MONA_COMMIT" \
     && git apply /opt/ABC/external/mona/mona_abc.patch \
     && libtoolize && aclocal && automake --gnu --add-missing && autoreconf -ivf \
     && ./configure && make all && make install && ldconfig
@@ -40,7 +49,7 @@ RUN cd /opt/ABC \
     && ldconfig
 
 # --- Stage 2: Runtime image ---
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -62,14 +71,9 @@ RUN ldconfig
 # Set up working directory
 WORKDIR /app
 
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir \
-       fastapi==0.129.0 \
-       uvicorn==0.41.0 \
-       anthropic==0.82.0 \
-       python-dotenv==1.2.1
+# Install the exact Python environment used for artifact validation.
+COPY requirements.lock.txt .
+RUN pip install --no-cache-dir -r requirements.lock.txt
 
 # Copy application code
 COPY src/ ./src/

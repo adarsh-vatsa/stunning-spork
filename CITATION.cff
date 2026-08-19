@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use this artifact, please cite the associated ISSRE 2026 paper."
+title: "PolicySummarizer Artifact"
+type: software
+authors:
+  - family-names: Vatsa
+    given-names: Adarsh
+    email: avatsa@stevens.edu
+    affiliation: Stevens Institute of Technology
+  - family-names: Hall
+    given-names: Bethel
+    affiliation: Stevens Institute of Technology
+  - family-names: Eiers
+    given-names: William
+    email: weiers@stevens.edu
+    affiliation: Stevens Institute of Technology
+repository-code: "https://github.com/fractional-distillation/stunning-spork"
+license: MIT
+version: 1.0.0
+date-released: 2026-08-18
+preferred-citation:
+  type: conference-paper
+  title: "Neurosymbolic Characterization for Reliable Access Control Policy Analysis"
+  authors:
+    - family-names: Vatsa
+      given-names: Adarsh
+    - family-names: Hall
+      given-names: Bethel
+    - family-names: Eiers
+      given-names: William
+  year: 2026

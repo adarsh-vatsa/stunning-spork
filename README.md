@@ -1,5 +1,25 @@
 # Large Language Model Synthesized Access Control Policy Verification
 
+## ISSRE 2026 Artifact Evaluation
+
+The reviewer instructions for the **Code and Dataset Reviewed** artifact,
+including the prerequisite **Available** badge, are in
+[`README.txt`](README.txt). Start the interactive reviewer console with:
+
+```bash
+bash artifact_evaluation/artifact.sh
+```
+
+Choose option 1 for the complete API-free reviewer check, or run it directly:
+
+```bash
+bash artifact_evaluation/artifact.sh review
+```
+
+The optional live interface is available at
+[policysummarizer.xyz](https://policysummarizer.xyz/). Artifact evaluation does
+not depend on the hosted service.
+
 ## Overview
 
 This repository contains the code and experimental artifacts for verifying LLM-synthesized access control policies. Our research explores techniques for generating, analyzing, and verifying access control policies using large language models, with a focus on AWS IAM policies, Azure role definitions, and GCP IAM bindings using formal verification methods.
@@ -57,9 +77,8 @@ We evaluate state-of-the-art language models on their ability to:
 ├── Exp-3/                  # Factors Affecting Summarization
 │   └── Exp-3.py           # Multi-string analysis
 │
-├── Exp-4-Zelkova/         # Zelkova-based Verification
-│   ├── Exp-4-Zelkova.py   # Z3 model enumeration
-│   └── z3_model_enum.py   # SMT solving utilities
+├── Exp-4-Zelkova/         # Z3 + LLM baseline
+│   └── z3_model_enum.py   # Reproducible model enumeration, regex generation, and scoring
 │
 ├── Dataset/               # AWS IAM Policy Dataset
 ├── Fine-tuning/           # Model Fine-tuning Experiments
@@ -104,12 +123,9 @@ The Docker image builds the ABC solver from source and bundles all dependencies.
    GOOGLE_API_KEY=your_key
    ```
 
-4. Install ABC solver:
-   ```bash
-   git clone https://github.com/vlab-cs-ucsb/ABC.git
-   cd ABC && mkdir build && cd build
-   cmake .. && make && sudo make install
-   ```
+4. Install the external ABC solver using its
+   [official installation guide](https://github.com/vlab-cs-ucsb/ABC/blob/master/INSTALL.md),
+   then verify the installation with `abc --help`.
 
 5. Quacky is included in the `artifacts/` directory with necessary modifications.
 
@@ -136,12 +152,74 @@ cd Exp-3/
 python Exp-3.py
 ```
 
-### Experiment 4: Zelkova-based Verification
-Uses Z3 theorem prover for formal policy verification and model enumeration.
+### Experiment 4: Z3 + LLM Baseline
+
+This experiment encodes each of the 41 original AWS policies with Quacky,
+enumerates up to 1,000 satisfying resource strings with Z3, asks Claude 4
+Sonnet for five regex candidates, repairs syntactically invalid candidates
+once, and retains the candidate with the highest Jaccard similarity. Every
+model file, candidate, diagnostic, selected regex, and policy-level result is
+saved. Aggregate statistics include perfect matches and report unscored
+policies separately.
+
+Install both the repository and Quacky dependencies, then set an Anthropic API
+key:
+
+ABC is maintained as a separate research project and is not vendored here.
+Install it using the official
+[ABC installation guide](https://github.com/vlab-cs-ucsb/ABC/blob/master/INSTALL.md),
+then confirm that `abc --help` succeeds. The runner checks for this executable
+before making any API calls.
+
 ```bash
-cd Exp-4-Zelkova/
-python Exp-4-Zelkova.py
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt -r artifacts/requirements.txt
+export ANTHROPIC_API_KEY="your-key"
+
+python Exp-4-Zelkova/z3_model_enum.py \
+  --max-models 1000 \
+  --num-candidates 5 \
+  --syntax-repairs 1 \
+  --output-dir Exp-4-Zelkova/results-1000
 ```
+
+Use `--resume` to continue an interrupted run. To verify SMT generation and Z3
+enumeration without making LLM calls, add `--enumerate-only`; use a fresh output
+directory for that check. The final `summary.json` reports the ordinary mean
+over every policy with a usable Jaccard score. It never removes perfect
+matches from the average.
+
+### Five-Size PolicySummarizer Protocol
+
+The paper's sample-size study uses 100, 500, 1,000, 1,500, and 2,000 strings
+over the 41 original policies. The Docker-backed runner preserves the sample
+sets, all five LLM candidates, syntax repairs, model metadata, token usage,
+timing, and coverage-aware aggregate statistics:
+
+The full run requires an Anthropic API account, an API key, sufficient paid
+credit and rate-limit quota, network access, and access to the selected model.
+It is not required for the API-free Reviewed-badge smoke test.
+
+```bash
+export ANTHROPIC_API_KEY="your-key"
+bash artifact_evaluation/run_protocol_replication.sh \
+  --model "your-available-model-id" --resume
+```
+
+This paid sweep makes 1,025 initial LLM calls plus any syntax repairs and can
+take many hours. A one-policy, API-free pipeline check is available with:
+
+```bash
+bash artifact_evaluation/run_protocol_replication.sh \
+  --enumerate-only --sample-sizes 100 --start-from 0 --end-at 0
+```
+
+The paper used a Claude 4 Sonnet snapshot. LLM responses are stochastic, and a
+different or no-longer-identical model snapshot cannot reproduce historical
+responses bit for bit. Such a run validates the experimental protocol and
+produces a new replication result; it should not be described as an exact
+reconstruction of the accepted paper's raw outputs.
 
 ### CPCA: Comprehensive Policy Analysis
 Full experimental framework for policy comprehension assessment.
